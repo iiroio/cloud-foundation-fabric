@@ -14,11 +14,11 @@ Use the following diagram as a simple high level reference for the following sec
   <img src="diagram.svg" alt="Organization-level diagram">
 </p>
 
-## Table of contents
-
+<!-- BEGIN TOC -->
 - [Design overview and choices](#design-overview-and-choices)
   - [User groups](#user-groups)
   - [Organization-level IAM](#organization-level-iam)
+  - [Organization policies and tag-based conditions](#organization-policies-and-tag-based-conditions)
   - [Automation project and resources](#automation-project-and-resources)
   - [Billing account](#billing-account)
   - [Organization-level logging](#organization-level-logging)
@@ -26,6 +26,10 @@ Use the following diagram as a simple high level reference for the following sec
   - [Workload Identity Federation and CI/CD](#workload-identity-federation-and-cicd)
 - [How to run this stage](#how-to-run-this-stage)
   - [Prerequisites](#prerequisites)
+    - [Standalone billing account](#standalone-billing-account)
+    - [Preventing creation of billing-related IAM bindings](#preventing-creation-of-billing-related-iam-bindings)
+    - [Groups](#groups)
+    - [Configure variables](#configure-variables)
   - [Output files and cross-stage variables](#output-files-and-cross-stage-variables)
   - [Running the stage](#running-the-stage)
 - [Customizations](#customizations)
@@ -35,6 +39,10 @@ Use the following diagram as a simple high level reference for the following sec
   - [Names and naming convention](#names-and-naming-convention)
   - [Workload Identity Federation](#workload-identity-federation)
   - [CI/CD repositories](#cicd-repositories)
+- [Files](#files)
+- [Variables](#variables)
+- [Outputs](#outputs)
+<!-- END TOC -->
 
 ## Design overview and choices
 
@@ -64,7 +72,7 @@ A full reference of IAM roles managed by this stage [is available here](./IAM.md
 
 It's often desirable to have organization policies deployed before any other resource in the org, so as to ensure compliance with specific requirements (e.g. location restrictions), or control the configuration of specific resources (e.g. default network at project creation or service account grants).
 
-To cover this use case, organization policies have been moved from the resource management to the bootstrap stage in FAST versions after 26.0.0. They are managed via the usual factory aopproach, and a [sample set of data files](./data/org-policies/) is included with this stage.
+To cover this use case, organization policies have been moved from the resource management to the bootstrap stage in FAST versions after 26.0.0. They are managed via the usual factory approach, and a [sample set of data files](./data/org-policies/) is included with this stage. They are not applied during the initial run when the `bootstrap_user` variable is set, to work around incompatibilies with user credentials.
 
 The only current exception to the factory approach is the `iam.allowedPolicyMemberDomains` constraint, which is managed in code so as to be able to auto-allow the organization's domain. More domains can be added via the `org_policies_config` variable, which also serves as an umbrella for future policies that will need to be managed in code.
 
@@ -75,6 +83,38 @@ Further tag values can be defined via the `org_policies_config.tag_values` varia
 Management of the rest of the tag hierarchy is delegated to the resource management stage, as that is often intimately tied to the folder hierarchy design.
 
 The organization policy tag key and values managed by this stage have been added to the `0-bootstrap.auto.tfvars` stage, so that IAM can be delegated to the resource management or successive stages via their ids.
+
+The following example shows an example on how to define an additional tag value, and use it in a boolean constraint rule.
+
+This snippet defines a new tag value under the `org-policies` tag key via the `org_policies_config` variable, and assigns the permission to bind it to a group.
+
+```hcl
+# stage 0 custom tfvars
+org_policies_config = {
+  tag_values = {
+    compute-require-oslogin-false = {
+      description = "Bind this tag to set oslogin to false."
+      iam = {
+        "roles/resourcemanager.tagUser" = [
+          "group:foo@example.com"
+        ]
+      }
+    }
+  }
+}
+# tftest skip
+```
+
+The above tag can be used to define a constraint condition via the `data/org-policies/compute.yaml` or similar factory file. The id in the condition is the organization id, followed by the name of the organization policy tag key (defaults to `org-policies`).
+
+```yaml
+compute.requireOsLogin:
+  rules:
+  - enforce: true
+  - enforce: false
+    condition:
+      expression: resource.matchTag('12345678/org-policies-config', 'compute-require-oslogin-false')
+```
 
 ### Automation project and resources
 
@@ -156,6 +196,7 @@ The roles that the Organization Admin used in the first `apply` needs to self-gr
 - Organization Administrator (`roles/resourcemanager.organizationAdmin`)
 - Project Creator (`roles/resourcemanager.projectCreator`)
 - Tag Admin (`roles/resourcemanager.tagAdmin`)
+- Owner (`roles/owner`)
 
 To quickly self-grant the above roles, run the following code snippet as the initial Organization Admin:
 
@@ -170,11 +211,12 @@ export FAST_ORG_ID=123456
 # set needed roles
 export FAST_ROLES="roles/billing.admin roles/logging.admin \
   roles/iam.organizationRoleAdmin roles/resourcemanager.projectCreator \
-  roles/resourcemanager.tagAdmin"
+  roles/resourcemanager.organizationAdmin roles/resourcemanager.tagAdmin \
+  roles/owner"
 
 for role in $FAST_ROLES; do
   gcloud organizations add-iam-policy-binding $FAST_ORG_ID \
-    --member user:$FAST_BU --role $role
+    --member user:$FAST_BU --role $role --condition None
 done
 ```
 
